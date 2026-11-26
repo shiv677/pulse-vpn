@@ -1,0 +1,52 @@
+name: Pulse VPN CI
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-lint:
+    name: Core Engine Tests & Static Lint Verification
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Lint Server Provisioning Shell Script
+        run: |
+          bash -n server/setup-server.sh
+          echo "server/setup-server.sh syntax OK"
+
+      - name: Lint Native Manifests, Packaging Configs & Dart Sources
+        run: |
+          python3 -c "
+          import json, xml.etree.ElementTree as ET
+          ET.parse('android/AndroidManifest.xml')
+          ET.parse('android/app/src/main/AndroidManifest.xml')
+          ET.parse('windows/wintun.manifest')
+          ET.parse('windows/runner/runner.exe.manifest')
+          with open('windows/packaging_config.json', encoding='utf-8') as f:
+              cfg = json.load(f)
+              assert cfg['driver']['dll_name'] == 'wintun.dll'
+              assert cfg['installer_output_name'] == 'PulseVPN-Setup'
+          print('XML manifests and Windows JSON packaging config valid.')
+          "
+
+      - name: Run Unit Test Suite
+        run: |
+          python3 test/test_core_engine.py

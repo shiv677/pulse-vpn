@@ -1,0 +1,26 @@
+{
+  "app_name": "Pulse VPN",
+  "executable_name": "pulse_vpn.exe",
+  "installer_output_name": "PulseVPN-Setup",
+  "version": "1.0.0",
+  "publisher": "Shivansh Dimri",
+  "architecture": "x64",
+  "driver": {
+    "dll_name": "wintun.dll",
+    "version": "0.14.1",
+    "adapter_name": "PulseVPN",
+    "tunnel_type": "WireGuard",
+    "adapter_guid": "{6B84F2A1-4E53-4A9E-9A7D-2C3E4F5A6B7C}",
+    "default_mtu": 1420,
+    "elevation": "requireAdministrator",
+    "manifest": "windows/wintun.manifest"
+  },
+  "packaging": {
+    "inno_setup_script": "packaging/windows/installer.iss",
+    "bundled_libraries": [
+      "flutter_windows.dll",
+      "wintun.dll"
+    ],
+    "firewall_killswitch_prefix": "PulseVPN_Killswitch"
+  }
+}

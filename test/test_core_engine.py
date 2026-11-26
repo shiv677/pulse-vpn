@@ -511,6 +511,74 @@ vg-uswest.opengw.net,203.0.113.3,30000,8,120000000,United States,US,20,54321,200
             self.assertIn("class VpnStateMachine", c)
             self.assertIn("class BandwidthTelemetry", c)
 
+    # 7. Verify Phase 3 Native Platform Integration, UI Dashboard & Packaging
+    def test_android_manifest_and_services(self):
+        import xml.etree.ElementTree as ET
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        for rel_path in ["android/AndroidManifest.xml", "android/app/src/main/AndroidManifest.xml"]:
+            manifest_path = os.path.join(base_dir, *rel_path.split("/"))
+            self.assertTrue(os.path.exists(manifest_path), f"Missing {rel_path}")
+            tree = ET.parse(manifest_path)
+            root = tree.getroot()
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                raw_xml = f.read()
+            self.assertIn("android.permission.BIND_VPN_SERVICE", raw_xml)
+            self.assertIn("android.permission.INTERNET", raw_xml)
+            self.assertIn("android.permission.ACCESS_NETWORK_STATE", raw_xml)
+            self.assertIn("android.permission.FOREGROUND_SERVICE_SPECIAL_USE", raw_xml)
+            self.assertIn("pulse_vpn_tunnel_channel", raw_xml)
+            self.assertIn("PulseVpnService", raw_xml)
+            self.assertIn("PulseTileService", raw_xml)
+            self.assertIsNotNone(root)
+
+    def test_windows_wintun_and_inno_setup_packaging(self):
+        import json
+        import xml.etree.ElementTree as ET
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+        wintun_manifest = os.path.join(base_dir, "windows", "wintun.manifest")
+        self.assertTrue(os.path.exists(wintun_manifest))
+        ET.parse(wintun_manifest)
+        with open(wintun_manifest, "r", encoding="utf-8") as f:
+            manifest_txt = f.read()
+        self.assertIn("requireAdministrator", manifest_txt)
+
+        pkg_cfg_path = os.path.join(base_dir, "windows", "packaging_config.json")
+        self.assertTrue(os.path.exists(pkg_cfg_path))
+        with open(pkg_cfg_path, "r", encoding="utf-8") as f:
+            pkg_cfg = json.load(f)
+        self.assertEqual(pkg_cfg["driver"]["dll_name"], "wintun.dll")
+        self.assertEqual(pkg_cfg["installer_output_name"], "PulseVPN-Setup")
+
+        iss_path = os.path.join(base_dir, "packaging", "windows", "installer.iss")
+        self.assertTrue(os.path.exists(iss_path))
+        with open(iss_path, "r", encoding="utf-8") as f:
+            iss_txt = f.read()
+        self.assertIn("OutputBaseFilename=PulseVPN-Setup", iss_txt)
+        self.assertIn("wintun.dll", iss_txt)
+        self.assertIn("PrivilegesRequired=admin", iss_txt)
+
+    def test_cyber_minimalist_ui_dashboard_and_workflows(self):
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        ui_home = os.path.join(base_dir, "lib", "ui", "home_screen.dart")
+        ui_speedometer = os.path.join(base_dir, "lib", "ui", "widgets", "speedometer_gauge.dart")
+        ui_picker = os.path.join(base_dir, "lib", "ui", "widgets", "server_picker_modal.dart")
+
+        for p in [ui_home, ui_speedometer, ui_picker]:
+            self.assertTrue(os.path.exists(p), f"Missing UI file: {p}")
+
+        with open(ui_home, "r", encoding="utf-8") as f:
+            home_txt = f.read()
+        self.assertIn("connect_toggle_button", home_txt)
+        self.assertIn("country_server_picker", home_txt)
+        self.assertIn("RealTimeSpeedometer", home_txt)
+        self.assertIn("VpnTunnelMode", home_txt)
+
+        ci_wf = os.path.join(base_dir, ".github", "workflows", "ci.yml")
+        build_wf = os.path.join(base_dir, ".github", "workflows", "build-clients.yml")
+        self.assertTrue(os.path.exists(ci_wf))
+        self.assertTrue(os.path.exists(build_wf))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
