@@ -1,0 +1,59 @@
+# Flutter / Dart
+.dart_tool/
+.packages
+build/
+pubspec.lock
+*.iml
+.flutter-plugins
+.flutter-plugins-dependencies
+.metadata
+
+# Android
+android/.gradle/
+android/local.properties
+android/app/debug/
+android/app/profile/
+android/app/release/
+*.apk
+*.aab
+*.dex
+*.class
+
+# Windows / C++
+windows/flutter/ephemeral/
+*.exe
+*.dll
+*.so
+*.dylib
+*.obj
+*.o
+*.pdb
+*.ilk
+*.exp
+*.lib
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# Python & Testing
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+venv/
+.venv/
+
+# VPN Configs, Keys & Logs
+*.conf
+*.key
+*.pub
+*.log
+server/clients/
+server/wgdata/
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
