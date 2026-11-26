@@ -9,12 +9,15 @@
 // - Pro Authentication modal trigger (Login / Pro) in top navigation bar
 // - Fast-Hop multi-relay rotation visualizer & 5s countdown indicator
 
+import 'dart:async';
 import 'package:flutter/material.dart';
 import '../core/auth_service.dart';
 import '../core/fast_hop.dart';
 import '../core/killswitch.dart';
+import '../core/native_tunnel_bridge.dart';
 import '../core/relay_discovery.dart';
 import '../core/telemetry.dart';
+import '../core/warp_provisioner.dart';
 import '../core/wireguard_config.dart';
 import 'widgets/auth_modal.dart';
 import 'widgets/fast_hop_indicator.dart';
@@ -39,12 +42,16 @@ class _PulseDashboardScreenState extends State<PulseDashboardScreen> {
   final WindowsKillswitchEngine _windowsKillswitch = const WindowsKillswitchEngine();
   final AuthService _authService = AuthService();
   final FastHopController _fastHopController = FastHopController();
+  final NativeTunnelBridge _tunnelBridge = NativeTunnelBridge();
+  final WarpProvisioner _warpProvisioner = WarpProvisioner();
 
   VpnTunnelMode _selectedMode = VpnTunnelMode.privateCloud;
   bool _killswitchEnabled = true;
   bool _allowLanTraffic = true;
   UserSession? _currentSession;
   int _fastHopElapsedSeconds = 0;
+  Timer? _fastHopTimer;
+  WireGuardConfig? _activeWireGuardConfig;
 
   late List<RelayNode> _relays;
   late RelayNode _activeRelay;
@@ -52,9 +59,18 @@ class _PulseDashboardScreenState extends State<PulseDashboardScreen> {
   @override
   void initState() {
     super.initState();
-    _relays = sortRelaysByJitter(_buildDefaultRelays());
+    _relays = sortRelaysByJitter([
+      ...WarpProvisioner.buildWarpRelayPool(),
+      ..._buildDefaultRelays(),
+    ]);
     _activeRelay = _relays.first;
     _fastHopController.updateCandidates(_relays);
+  }
+
+  @override
+  void dispose() {
+    _fastHopTimer?.cancel();
+    super.dispose();
   }
 
   List<RelayNode> _buildDefaultRelays() {
@@ -122,11 +138,22 @@ class _PulseDashboardScreenState extends State<PulseDashboardScreen> {
     ];
   }
 
-  void _toggleConnection() {
-    setState(() {
-      if (_stateMachine.currentState == VpnConnectionState.disconnected ||
-          _stateMachine.currentState == VpnConnectionState.error) {
+  Future<void> _toggleConnection() async {
+    if (_stateMachine.currentState == VpnConnectionState.disconnected ||
+        _stateMachine.currentState == VpnConnectionState.error) {
+      setState(() {
         _stateMachine.transition(VpnConnectionState.connecting);
+      });
+
+      final endpoint = '${_activeRelay.ip}:2408';
+      final config = await _warpProvisioner.provisionFreeConfig(
+        endpointOverride: endpoint,
+      );
+      _activeWireGuardConfig = config;
+      await _tunnelBridge.startTunnel(config);
+
+      if (!mounted) return;
+      setState(() {
         _stateMachine.transition(VpnConnectionState.connected);
         _telemetry.update(
           totalRxBytes: 18450000,
@@ -136,7 +163,15 @@ class _PulseDashboardScreenState extends State<PulseDashboardScreen> {
           packetsLost: 1,
           duration: const Duration(minutes: 14, seconds: 38),
         );
-      } else {
+      });
+      _startFastHopLoop();
+    } else {
+      _fastHopTimer?.cancel();
+      _fastHopTimer = null;
+      await _tunnelBridge.stopTunnel();
+
+      if (!mounted) return;
+      setState(() {
         _stateMachine.transition(VpnConnectionState.disconnected);
         _telemetry.update(
           totalRxBytes: 0,
@@ -146,6 +181,41 @@ class _PulseDashboardScreenState extends State<PulseDashboardScreen> {
           packetsLost: 0,
           duration: Duration.zero,
         );
+      });
+    }
+  }
+
+  void _startFastHopLoop() {
+    _fastHopTimer?.cancel();
+    _fastHopTimer = Timer.periodic(const Duration(seconds: 1), (_) async {
+      if (!mounted ||
+          _stateMachine.currentState != VpnConnectionState.connected ||
+          !_fastHopController.interval.isEnabled) {
+        return;
+      }
+
+      final previousHopCount = _fastHopController.hopCount;
+      _fastHopController.tickSecond(session: _currentSession);
+
+      if (_fastHopController.hopCount > previousHopCount &&
+          _fastHopController.activePeer != null) {
+        final nextPeer = _fastHopController.activePeer!;
+        final peerPubKey = (_activeWireGuardConfig != null &&
+                _activeWireGuardConfig!.peers.isNotEmpty)
+            ? _activeWireGuardConfig!.peers.first.publicKey
+            : WarpProvisioner.warpAnycastPublicKey;
+        await _tunnelBridge.rotatePeerEndpoint(
+          peerPublicKey: peerPubKey,
+          newEndpoint: '${nextPeer.ip}:2408',
+        );
+      }
+
+      if (mounted) {
+        setState(() {
+          _activeRelay = _fastHopController.activePeer ?? _activeRelay;
+          _fastHopElapsedSeconds =
+              (_fastHopElapsedSeconds + 1) % _fastHopController.interval.seconds;
+        });
       }
     });
   }
@@ -198,7 +268,10 @@ class _PulseDashboardScreenState extends State<PulseDashboardScreen> {
         );
         _fastHopController.preWarmStandby();
         _activeRelay = _fastHopController.activePeer ?? _activeRelay;
-        _fastHopElapsedSeconds = 3;
+        _fastHopElapsedSeconds = 0;
+        if (_stateMachine.currentState == VpnConnectionState.connected) {
+          _startFastHopLoop();
+        }
       } else {
         _openAuthModal();
       }

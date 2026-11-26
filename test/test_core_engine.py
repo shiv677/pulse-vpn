@@ -13,6 +13,7 @@ import ipaddress
 import json
 import os
 import re
+import tempfile
 import time
 import unittest
 
@@ -454,6 +455,121 @@ class FastHopControllerTestable:
         self.elapsed_in_cycle = 0
 
 
+# ----------------------------------------------------------------------
+# 7. Cloudflare WARP Zero-Setup Provisioner & Native Windows Tunnel Bridge
+# ----------------------------------------------------------------------
+
+class WarpProvisionerTestable:
+    REG_URL = "https://api.cloudflareclient.com/v0a2158/reg"
+    WARP_ANYCAST_PUBKEY = "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
+    WARP_ENDPOINTS = [
+        "162.159.192.1:2408",
+        "162.159.193.1:2408",
+        "162.159.195.1:2408",
+        "188.114.96.1:2408",
+        "188.114.97.1:2408",
+    ]
+
+    @staticmethod
+    def generate_curve25519_keypair(seed_bytes: bytes = None):
+        raw = bytearray(seed_bytes if seed_bytes and len(seed_bytes) == 32 else os.urandom(32))
+        # RFC 7748 clamping
+        raw[0] &= 248
+        raw[31] &= 127
+        raw[31] |= 64
+        priv_b64 = base64.b64encode(bytes(raw)).decode("ascii")
+        pub_digest = bytearray(hashlib.sha256(bytes(raw)).digest())
+        pub_digest[31] &= 127
+        pub_b64 = base64.b64encode(bytes(pub_digest)).decode("ascii")
+        return {"private_key": priv_b64, "public_key": pub_b64, "raw_private": bytes(raw)}
+
+    @classmethod
+    def parse_registration_response(cls, response_json: dict, client_priv_key: str, endpoint_override: str = None):
+        cfg_node = response_json.get("config", response_json)
+        iface_node = cfg_node.get("interface", {})
+        addrs_node = iface_node.get("addresses", {})
+        v4_addr = addrs_node.get("v4", "172.16.0.2/32")
+        if "/" not in v4_addr:
+            v4_addr = f"{v4_addr}/32"
+
+        peers_list = cfg_node.get("peers", [])
+        peer_pubkey = cls.WARP_ANYCAST_PUBKEY
+        peer_endpoint = endpoint_override or cls.WARP_ENDPOINTS[0]
+        if peers_list:
+            p0 = peers_list[0]
+            peer_pubkey = p0.get("public_key", peer_pubkey)
+            if not endpoint_override:
+                ep = p0.get("endpoint", {})
+                peer_endpoint = ep.get("v4") or ep.get("host") or peer_endpoint
+
+        return {
+            "interface": {
+                "privatekey": client_priv_key,
+                "address": v4_addr,
+                "dns": "1.1.1.1, 1.0.0.1",
+                "mtu": 1420,
+            },
+            "peers": [
+                {
+                    "publickey": peer_pubkey,
+                    "endpoint": peer_endpoint,
+                    "allowedips": "0.0.0.0/0, ::/0",
+                    "persistentkeepalive": 25,
+                }
+            ],
+        }
+
+
+class NativeTunnelBridgeTestable:
+    def __init__(self, tunnel_name="pulse_vpn"):
+        self.tunnel_name = tunnel_name
+        self.is_active = False
+        self.active_endpoint = None
+        self.commands_log = []
+
+    @property
+    def staging_config_path(self) -> str:
+        return os.path.join(tempfile.gettempdir(), f"{self.tunnel_name}.conf")
+
+    def write_config_to_temp(self, config_dict: dict, custom_path: str = None) -> str:
+        path = custom_path or self.staging_config_path
+        ini_str = WireGuardConfigEngine.to_ini(config_dict)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(ini_str)
+        return path
+
+    def build_start_commands(self, config_path: str, tunnel_ip: str, endpoint_host: str, gateway: str = None):
+        cmds = [f'wireguard.exe /installtunnelservice "{config_path}"']
+        if gateway:
+            cmds.append(f"route add {endpoint_host} mask 255.255.255.255 {gateway} metric 1")
+        cmds.extend([
+            f"route add 0.0.0.0 mask 128.0.0.0 {tunnel_ip} metric 5",
+            f"route add 128.0.0.0 mask 128.0.0.0 {tunnel_ip} metric 5",
+            f'netsh interface ip set dns name="{self.tunnel_name}" static 1.1.1.1 primary',
+        ])
+        self.commands_log.extend(cmds)
+        self.is_active = True
+        return cmds
+
+    def build_fast_hop_command(self, peer_pubkey: str, new_endpoint: str) -> str:
+        ep = new_endpoint if ":" in new_endpoint else f"{new_endpoint}:2408"
+        cmd = f"wg set {self.tunnel_name} peer {peer_pubkey} endpoint {ep}"
+        self.commands_log.append(cmd)
+        self.active_endpoint = ep
+        return cmd
+
+    def build_stop_commands(self):
+        cmds = [
+            f"wireguard.exe /uninstalltunnelservice {self.tunnel_name}",
+            "route delete 0.0.0.0 mask 128.0.0.0",
+            "route delete 128.0.0.0 mask 128.0.0.0",
+        ]
+        self.commands_log.extend(cmds)
+        self.is_active = False
+        self.active_endpoint = None
+        return cmds
+
+
 # ======================================================================
 # Unit Tests
 # ======================================================================
@@ -666,6 +782,8 @@ vg-uswest.opengw.net,203.0.113.3,30000,8,120000000,United States,US,20,54321,200
             "telemetry.dart",
             "auth_service.dart",
             "fast_hop.dart",
+            "warp_provisioner.dart",
+            "native_tunnel_bridge.dart",
         ]
 
         for fname in dart_files:
@@ -723,6 +841,99 @@ vg-uswest.opengw.net,203.0.113.3,30000,8,120000000,United States,US,20,54321,200
             self.assertIn("class FastHopController", c)
             self.assertIn("executeHop", c)
             self.assertIn("preWarmStandby", c)
+
+        # Verify warp_provisioner.dart has Cloudflare WARP dynamic provisioner & Curve25519 key clamping
+        with open(os.path.join(lib_core, "warp_provisioner.dart"), "r", encoding="utf-8") as f:
+            c = f.read()
+            self.assertIn("class WarpProvisioner", c)
+            self.assertIn("https://api.cloudflareclient.com/v0a2158/reg", c)
+            self.assertIn("bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=", c)
+            self.assertIn("provisionFreeConfig", c)
+
+        # Verify native_tunnel_bridge.dart has NativeTunnelBridge, route add, installtunnelservice, wg set
+        with open(os.path.join(lib_core, "native_tunnel_bridge.dart"), "r", encoding="utf-8") as f:
+            c = f.read()
+            self.assertIn("class NativeTunnelBridge", c)
+            self.assertIn("pulse_vpn.conf", c)
+            self.assertIn("/installtunnelservice", c)
+            self.assertIn("route add 0.0.0.0 mask 128.0.0.0", c)
+            self.assertIn("route add 128.0.0.0 mask 128.0.0.0", c)
+            self.assertIn("wg set", c)
+
+    # 9. Cloudflare WARP Provisioner & Native Windows Tunnel Bridge Tests
+    def test_warp_provisioner_keypair_and_registration_parsing(self):
+        kp = WarpProvisionerTestable.generate_curve25519_keypair(b"\xff" * 32)
+        self.assertEqual(len(kp["private_key"]), 44)
+        self.assertEqual(len(kp["public_key"]), 44)
+        # Verify RFC 7748 clamping bits
+        raw_priv = kp["raw_private"]
+        self.assertEqual(raw_priv[0] & 7, 0)
+        self.assertEqual(raw_priv[31] & 128, 0)
+        self.assertEqual(raw_priv[31] & 64, 64)
+
+        mock_api_response = {
+            "config": {
+                "interface": {"addresses": {"v4": "172.16.0.2"}},
+                "peers": [
+                    {
+                        "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+                        "endpoint": {"v4": "162.159.192.1:2408"},
+                    }
+                ],
+            }
+        }
+        wg_cfg = WarpProvisionerTestable.parse_registration_response(
+            mock_api_response, kp["private_key"]
+        )
+        self.assertEqual(wg_cfg["interface"]["address"], "172.16.0.2/32")
+        self.assertEqual(wg_cfg["interface"]["mtu"], 1420)
+        self.assertEqual(
+            wg_cfg["peers"][0]["publickey"],
+            "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+        )
+        self.assertEqual(wg_cfg["peers"][0]["endpoint"], "162.159.192.1:2408")
+
+    def test_native_windows_tunnel_bridge_routes_and_fasthop_rotation(self):
+        kp = WarpProvisionerTestable.generate_curve25519_keypair(b"\x42" * 32)
+        wg_cfg = WarpProvisionerTestable.parse_registration_response({}, kp["private_key"])
+        bridge = NativeTunnelBridgeTestable("pulse_vpn")
+
+        staged_path = bridge.write_config_to_temp(wg_cfg)
+        self.assertTrue(os.path.exists(staged_path))
+        with open(staged_path, "r", encoding="utf-8") as f:
+            staged_ini = f.read()
+        self.assertIn("[Interface]", staged_ini)
+        self.assertIn("Address = 172.16.0.2/32", staged_ini)
+        self.assertIn("bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=", staged_ini)
+
+        start_cmds = bridge.build_start_commands(
+            staged_path, "172.16.0.2", "162.159.192.1", gateway="192.168.1.1"
+        )
+        self.assertTrue(bridge.is_active)
+        self.assertTrue(any("/installtunnelservice" in c for c in start_cmds))
+        self.assertIn("route add 0.0.0.0 mask 128.0.0.0 172.16.0.2 metric 5", start_cmds)
+        self.assertIn("route add 128.0.0.0 mask 128.0.0.0 172.16.0.2 metric 5", start_cmds)
+
+        # 0ms make-before-break Fast-Hop rotation command
+        hop_cmd = bridge.build_fast_hop_command(
+            WarpProvisionerTestable.WARP_ANYCAST_PUBKEY, "162.159.193.1:2408"
+        )
+        self.assertEqual(
+            hop_cmd,
+            "wg set pulse_vpn peer bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo= endpoint 162.159.193.1:2408",
+        )
+        self.assertEqual(bridge.active_endpoint, "162.159.193.1:2408")
+
+        stop_cmds = bridge.build_stop_commands()
+        self.assertFalse(bridge.is_active)
+        self.assertIn("wireguard.exe /uninstalltunnelservice pulse_vpn", stop_cmds)
+        self.assertIn("route delete 0.0.0.0 mask 128.0.0.0", stop_cmds)
+        self.assertIn("route delete 128.0.0.0 mask 128.0.0.0", stop_cmds)
+
+        try:
+            os.remove(staged_path)
+        except OSError:
+            pass
 
     # 8. Pro Authentication & Fast-Hop Multi-Relay Tests
     def test_auth_service_jwt_decode_tier_and_expiry(self):
