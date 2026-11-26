@@ -1,9 +1,9 @@
 ; Pulse VPN - Inno Setup Windows Installer Script
 ; packaging/windows/installer.iss
-; Builds standalone signed/elevated installer: PulseVPN-Setup.exe
+; Builds standalone signed/elevated installer: PulseVPN-Setup.exe (v1.2.0)
 
 #define MyAppName "Pulse VPN"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.2.0"
 #define MyAppPublisher "Shivansh Dimri"
 #define MyAppURL "https://github.com/shiv677/pulse-vpn"
 #define MyAppExeName "pulse_vpn.exe"
@@ -40,8 +40,11 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Source: "..\..\build\windows\x64\runner\Release\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\build\windows\x64\runner\Release\*.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "..\..\build\windows\x64\runner\Release\data\*"; DestDir: "{app}\data"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
-; Signed Wintun Layer-3 TUN Driver DLL and Loader Manifest
+; Signed Wintun Layer-3 TUN Driver DLL, Tunnel Helper Runner, and Loader Manifest
 Source: "..\..\windows\wintun.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "..\..\windows\wireguard.exe"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "..\..\windows\wg.exe"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "..\..\windows\pulse-tunnel-helper.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\windows\wintun.manifest"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\windows\packaging_config.json"; DestDir: "{app}"; Flags: ignoreversion
 
@@ -53,5 +56,5 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: de
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent runascurrentuser
 
 [UninstallRun]
-; Ensure any active WFP / Firewall killswitch rules are cleaned up on uninstall
-Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""Get-NetFirewallRule -DisplayName 'PulseVPN_Killswitch_*' -ErrorAction SilentlyContinue | Remove-NetFirewallRule; netsh advfirewall set allprofiles firewallpolicy blockinbound,allowoutbound"""; Flags: runhidden; RunOnceId: "CleanupPulseVpnKillswitch"
+; Ensure any active WireGuard tunnel service, split-default routes, and WFP killswitch rules are cleaned up on uninstall
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""wireguard.exe /uninstalltunnelservice pulse_vpn 2>$null; route.exe delete 0.0.0.0 mask 128.0.0.0 2>$null; route.exe delete 128.0.0.0 mask 128.0.0.0 2>$null; Get-NetFirewallRule -DisplayName 'PulseVPN_Killswitch_*' -ErrorAction SilentlyContinue | Remove-NetFirewallRule; netsh advfirewall set allprofiles firewallpolicy blockinbound,allowoutbound"""; Flags: runhidden; RunOnceId: "CleanupPulseVpnKillswitchAndRoutes"

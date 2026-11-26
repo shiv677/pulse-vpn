@@ -1101,6 +1101,10 @@ vg-uswest,203.0.113.30,30000,8,120000000,United States,US,20,54321,200,9000,2,Ad
             pkg_cfg = json.load(f)
         self.assertEqual(pkg_cfg["driver"]["dll_name"], "wintun.dll")
         self.assertEqual(pkg_cfg["installer_output_name"], "PulseVPN-Setup")
+        self.assertEqual(pkg_cfg["version"], "1.2.0")
+
+        helper_ps1 = os.path.join(base_dir, "windows", "pulse-tunnel-helper.ps1")
+        self.assertTrue(os.path.exists(helper_ps1))
 
         iss_path = os.path.join(base_dir, "packaging", "windows", "installer.iss")
         self.assertTrue(os.path.exists(iss_path))
@@ -1108,6 +1112,8 @@ vg-uswest,203.0.113.30,30000,8,120000000,United States,US,20,54321,200,9000,2,Ad
             iss_txt = f.read()
         self.assertIn("OutputBaseFilename=PulseVPN-Setup", iss_txt)
         self.assertIn("wintun.dll", iss_txt)
+        self.assertIn("pulse-tunnel-helper.ps1", iss_txt)
+        self.assertIn("/uninstalltunnelservice pulse_vpn", iss_txt)
         self.assertIn("PrivilegesRequired=admin", iss_txt)
 
     def test_cyber_minimalist_ui_dashboard_and_workflows(self):

@@ -1,7 +1,7 @@
 name: pulse_vpn
 description: Cross-platform WireGuard VPN client and zero-configuration server suite for Windows and Android.
 publish_to: 'none'
-version: 1.0.0+1
+version: 1.2.0+2
 
 environment:
   sdk: '>=3.3.0 <4.0.0'

@@ -67,6 +67,7 @@ jobs:
           flutter config --enable-windows-desktop
           New-Item -ItemType Directory -Force -Path "temp_wintun"
           Copy-Item "windows\wintun*" "temp_wintun\" -Force
+          Copy-Item "windows\pulse-tunnel-helper.ps1" "temp_wintun\" -Force
           Copy-Item "windows\packaging_config.json" "temp_wintun\" -Force
           Remove-Item -Recurse -Force "windows"
           flutter create . --platforms=windows --org com.shivansh
