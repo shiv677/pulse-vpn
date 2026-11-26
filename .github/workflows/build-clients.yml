@@ -65,7 +65,13 @@ jobs:
         shell: pwsh
         run: |
           flutter config --enable-windows-desktop
+          New-Item -ItemType Directory -Force -Path "temp_wintun"
+          Copy-Item "windows\wintun*" "temp_wintun\" -Force
+          Copy-Item "windows\packaging_config.json" "temp_wintun\" -Force
+          Remove-Item -Recurse -Force "windows"
           flutter create . --platforms=windows --org com.shivansh
+          Copy-Item "temp_wintun\*" "windows\" -Force
+          Remove-Item -Recurse -Force "temp_wintun"
           flutter pub get
 
       - name: Build Flutter Windows Release Binary
