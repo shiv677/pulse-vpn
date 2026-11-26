@@ -815,8 +815,10 @@ vg-uswest,203.0.113.30,30000,8,120000000,United States,US,20,54321,200,9000,2,Ad
         ui_home = os.path.join(base_dir, "lib", "ui", "home_screen.dart")
         ui_speedometer = os.path.join(base_dir, "lib", "ui", "widgets", "speedometer_gauge.dart")
         ui_picker = os.path.join(base_dir, "lib", "ui", "widgets", "server_picker_modal.dart")
+        ui_auth = os.path.join(base_dir, "lib", "ui", "widgets", "auth_modal.dart")
+        ui_fasthop = os.path.join(base_dir, "lib", "ui", "widgets", "fast_hop_indicator.dart")
 
-        for p in [ui_home, ui_speedometer, ui_picker]:
+        for p in [ui_home, ui_speedometer, ui_picker, ui_auth, ui_fasthop]:
             self.assertTrue(os.path.exists(p), f"Missing UI file: {p}")
 
         with open(ui_home, "r", encoding="utf-8") as f:
@@ -825,6 +827,36 @@ vg-uswest,203.0.113.30,30000,8,120000000,United States,US,20,54321,200,9000,2,Ad
         self.assertIn("country_server_picker", home_txt)
         self.assertIn("RealTimeSpeedometer", home_txt)
         self.assertIn("VpnTunnelMode", home_txt)
+        self.assertIn("AuthModal", home_txt)
+        self.assertIn("Login / Pro", home_txt)
+        self.assertIn("FastHopIndicator", home_txt)
+
+        with open(ui_auth, "r", encoding="utf-8") as f:
+            auth_txt = f.read()
+        self.assertIn("class AuthModal", auth_txt)
+        self.assertIn("auth_email_field", auth_txt)
+        self.assertIn("auth_password_field", auth_txt)
+        self.assertIn("auth_submit_button", auth_txt)
+        self.assertIn("pro_tier_badge", auth_txt)
+
+        with open(ui_fasthop, "r", encoding="utf-8") as f:
+            fh_txt = f.read()
+        self.assertIn("class FastHopIndicator", fh_txt)
+        self.assertIn("5s (Extreme Privacy)", fh_txt)
+        self.assertIn("30s", fh_txt)
+        self.assertIn("1m", fh_txt)
+        self.assertIn("5m", fh_txt)
+        self.assertIn("Off", fh_txt)
+        self.assertIn("Active Relay", fh_txt)
+        self.assertIn("Standby Relay (Pre-warmed)", fh_txt)
+        self.assertIn("Upgrade to Pro", fh_txt)
+
+        # Verify balanced Dart braces/parentheses across all UI and core Dart files
+        for dart_path in [ui_home, ui_speedometer, ui_picker, ui_auth, ui_fasthop]:
+            with open(dart_path, "r", encoding="utf-8") as f:
+                src = f.read()
+            self.assertEqual(src.count("{"), src.count("}"), f"Unbalanced braces in {dart_path}")
+            self.assertEqual(src.count("("), src.count(")"), f"Unbalanced parens in {dart_path}")
 
         ci_wf = os.path.join(base_dir, ".github", "workflows", "ci.yml")
         build_wf = os.path.join(base_dir, ".github", "workflows", "build-clients.yml")

@@ -6,12 +6,18 @@
 // - Real-time speedometer (Rx/Tx Mbps radial gauge + packet loss telemetry)
 // - Country/server picker (Unicode flag emoji, latency, jitter, lowest-jitter sort)
 // - Private/public mode switcher (Private Cloud Oracle Exit vs Public VPN Gate Relay)
+// - Pro Authentication modal trigger (Login / Pro) in top navigation bar
+// - Fast-Hop multi-relay rotation visualizer & 5s countdown indicator
 
 import 'package:flutter/material.dart';
+import '../core/auth_service.dart';
+import '../core/fast_hop.dart';
 import '../core/killswitch.dart';
 import '../core/relay_discovery.dart';
 import '../core/telemetry.dart';
 import '../core/wireguard_config.dart';
+import 'widgets/auth_modal.dart';
+import 'widgets/fast_hop_indicator.dart';
 import 'widgets/server_picker_modal.dart';
 import 'widgets/speedometer_gauge.dart';
 
@@ -31,10 +37,14 @@ class _PulseDashboardScreenState extends State<PulseDashboardScreen> {
   final VpnStateMachine _stateMachine = VpnStateMachine();
   final BandwidthTelemetry _telemetry = BandwidthTelemetry();
   final WindowsKillswitchEngine _windowsKillswitch = const WindowsKillswitchEngine();
+  final AuthService _authService = AuthService();
+  final FastHopController _fastHopController = FastHopController();
 
   VpnTunnelMode _selectedMode = VpnTunnelMode.privateCloud;
   bool _killswitchEnabled = true;
   bool _allowLanTraffic = true;
+  UserSession? _currentSession;
+  int _fastHopElapsedSeconds = 0;
 
   late List<RelayNode> _relays;
   late RelayNode _activeRelay;
@@ -44,6 +54,7 @@ class _PulseDashboardScreenState extends State<PulseDashboardScreen> {
     super.initState();
     _relays = sortRelaysByJitter(_buildDefaultRelays());
     _activeRelay = _relays.first;
+    _fastHopController.updateCandidates(_relays);
   }
 
   List<RelayNode> _buildDefaultRelays() {
@@ -156,6 +167,44 @@ class _PulseDashboardScreenState extends State<PulseDashboardScreen> {
     });
   }
 
+  void _openAuthModal() {
+    showDialog<UserSession?>(
+      context: context,
+      builder: (context) => AuthModal(
+        authService: _authService,
+        onSessionUpdated: (session) {
+          setState(() {
+            _currentSession = session;
+            if (!(session?.isPro ?? false)) {
+              _fastHopController.disable();
+              _fastHopElapsedSeconds = 0;
+            }
+          });
+        },
+      ),
+    );
+  }
+
+  void _handleFastHopIntervalChange(FastHopInterval interval) {
+    setState(() {
+      if (interval == FastHopInterval.disabled) {
+        _fastHopController.disable();
+        _fastHopElapsedSeconds = 0;
+      } else if (_currentSession?.isPro ?? false) {
+        _fastHopController.enable(
+          session: _currentSession,
+          interval: interval,
+          relays: _relays,
+        );
+        _fastHopController.preWarmStandby();
+        _activeRelay = _fastHopController.activePeer ?? _activeRelay;
+        _fastHopElapsedSeconds = 3;
+      } else {
+        _openAuthModal();
+      }
+    });
+  }
+
   void _openCountryServerPicker() {
     showModalBottomSheet<RelayNode>(
       context: context,
@@ -197,9 +246,9 @@ class _PulseDashboardScreenState extends State<PulseDashboardScreen> {
                     crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
                       _buildTopHeader(isConnected, accentColor),
-                      const SizedBox(height: 20),
+                      const SizedBox(height: 18),
                       _buildPrivatePublicModeSwitcher(accentColor),
-                      const SizedBox(height: 24),
+                      const SizedBox(height: 20),
                       Expanded(
                         child: isDesktop
                             ? _buildDesktopTwoColumnLayout(isConnected, accentColor)
@@ -217,6 +266,8 @@ class _PulseDashboardScreenState extends State<PulseDashboardScreen> {
   }
 
   Widget _buildTopHeader(bool isConnected, Color accentColor) {
+    final isPro = _currentSession?.isPro ?? false;
+
     return Row(
       mainAxisAlignment: MainAxisAlignment.spaceBetween,
       children: [
@@ -249,24 +300,66 @@ class _PulseDashboardScreenState extends State<PulseDashboardScreen> {
             ),
           ],
         ),
-        Container(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-          decoration: BoxDecoration(
-            color: const Color(0xFF111622),
-            borderRadius: BorderRadius.circular(8),
-            border: Border.all(color: accentColor.withOpacity(0.35)),
-          ),
-          child: Text(
-            isConnected
-                ? 'CHACHA20-POLY1305 • MTU ${WireGuardInterface.clampMtu(1420)}'
-                : 'STANDBY • SPLIT-ROUTE READY',
-            style: TextStyle(
-              color: accentColor,
-              fontSize: 11,
-              fontWeight: FontWeight.w600,
-              letterSpacing: 1.2,
+        Row(
+          children: [
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+              decoration: BoxDecoration(
+                color: const Color(0xFF111622),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: accentColor.withOpacity(0.35)),
+              ),
+              child: Text(
+                isConnected
+                    ? 'CHACHA20-POLY1305 • MTU ${WireGuardInterface.clampMtu(1420)}'
+                    : 'STANDBY • SPLIT-ROUTE READY',
+                style: TextStyle(
+                  color: accentColor,
+                  fontSize: 11,
+                  fontWeight: FontWeight.w600,
+                  letterSpacing: 1.2,
+                ),
+              ),
             ),
-          ),
+            const SizedBox(width: 10),
+            InkWell(
+              key: const Key('login_pro_nav_button'),
+              onTap: _openAuthModal,
+              borderRadius: BorderRadius.circular(8),
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                decoration: BoxDecoration(
+                  color: isPro
+                      ? const Color(0xFF10B981).withOpacity(0.18)
+                      : const Color(0xFF111622),
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(
+                    color: isPro ? const Color(0xFF10B981) : const Color(0xFF00F0FF),
+                  ),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      isPro ? Icons.verified_user_rounded : Icons.person_outline_rounded,
+                      size: 14,
+                      color: isPro ? const Color(0xFF10B981) : const Color(0xFF00F0FF),
+                    ),
+                    const SizedBox(width: 6),
+                    Text(
+                      isPro ? 'PRO ACTIVE' : 'Login / Pro',
+                      style: TextStyle(
+                        color: isPro ? const Color(0xFF10B981) : Colors.white,
+                        fontSize: 11,
+                        fontWeight: FontWeight.w700,
+                        letterSpacing: 0.9,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ],
         ),
       ],
     );
@@ -361,23 +454,31 @@ class _PulseDashboardScreenState extends State<PulseDashboardScreen> {
         const SizedBox(width: 24),
         Expanded(
           flex: 7,
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              Expanded(
-                child: RealTimeSpeedometer(
+          child: SingleChildScrollView(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                RealTimeSpeedometer(
                   rxSpeedMbps: _telemetry.rxSpeedMbps,
                   txSpeedMbps: _telemetry.txSpeedMbps,
                   packetLossPercent: _telemetry.packetLossPercent,
                   isConnected: isConnected,
                   accentColor: accentColor,
                 ),
-              ),
-              const SizedBox(height: 20),
-              _buildCountryServerPickerCard(accentColor),
-              const SizedBox(height: 16),
-              _buildKillswitchSecurityFooter(accentColor),
-            ],
+                const SizedBox(height: 16),
+                FastHopIndicator(
+                  controller: _fastHopController,
+                  session: _currentSession,
+                  elapsedSecondsInCycle: _fastHopElapsedSeconds,
+                  onIntervalChanged: _handleFastHopIntervalChange,
+                  onUpgradeToProRequested: _openAuthModal,
+                ),
+                const SizedBox(height: 16),
+                _buildCountryServerPickerCard(accentColor),
+                const SizedBox(height: 14),
+                _buildKillswitchSecurityFooter(accentColor),
+              ],
+            ),
           ),
         ),
       ],
@@ -397,6 +498,14 @@ class _PulseDashboardScreenState extends State<PulseDashboardScreen> {
             packetLossPercent: _telemetry.packetLossPercent,
             isConnected: isConnected,
             accentColor: accentColor,
+          ),
+          const SizedBox(height: 16),
+          FastHopIndicator(
+            controller: _fastHopController,
+            session: _currentSession,
+            elapsedSecondsInCycle: _fastHopElapsedSeconds,
+            onIntervalChanged: _handleFastHopIntervalChange,
+            onUpgradeToProRequested: _openAuthModal,
           ),
           const SizedBox(height: 16),
           _buildCountryServerPickerCard(accentColor),
