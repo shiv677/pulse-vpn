@@ -6,9 +6,12 @@ VPN Gate relay discovery parsing, killswitch rules, and telemetry state machine.
 Zero external dependencies (uses standard library unittest).
 """
 
+import base64
 import ipaddress
+import json
 import os
 import re
+import time
 import unittest
 
 # ----------------------------------------------------------------------
@@ -264,6 +267,157 @@ class BandwidthTelemetryCalculator:
         return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
+# ----------------------------------------------------------------------
+# 6. Pro Authentication & Fast-Hop Engine
+# ----------------------------------------------------------------------
+
+class UserSessionTestable:
+    def __init__(self, user_id: str, email: str, tier: str, token: str, expires_at: int):
+        self.user_id = user_id
+        self.email = email
+        self.tier = tier.lower()
+        self.token = token
+        self.expires_at = expires_at
+
+    def is_expired(self, now_ts: int = None) -> bool:
+        check_ts = int(time.time()) if now_ts is None else now_ts
+        return check_ts >= self.expires_at
+
+    @property
+    def is_pro(self) -> bool:
+        return self.tier == "pro" and not self.is_expired()
+
+
+class AuthServiceTestable:
+    def __init__(self):
+        self.stored_token = None
+        self.current_session = None
+
+    @staticmethod
+    def create_jwt(sub: str, email: str, tier: str, exp: int) -> str:
+        header = base64.urlsafe_b64encode(json.dumps({"alg": "HS256", "typ": "JWT"}).encode()).decode().rstrip("=")
+        payload = base64.urlsafe_b64encode(
+            json.dumps({"sub": sub, "email": email, "tier": tier, "exp": exp}).encode()
+        ).decode().rstrip("=")
+        sig = base64.urlsafe_b64encode(f"sig_{sub}_{tier}".encode()).decode().rstrip("=")
+        return f"{header}.{payload}.{sig}"
+
+    @staticmethod
+    def decode_jwt_claims(token: str) -> dict:
+        parts = token.strip().split(".")
+        if len(parts) != 3:
+            raise ValueError("Invalid JWT format")
+        payload_b64 = parts[1]
+        padding = "=" * ((4 - len(payload_b64) % 4) % 4)
+        raw = base64.urlsafe_b64decode(payload_b64 + padding).decode("utf-8")
+        return json.loads(raw)
+
+    def verify_token(self, token: str, now_ts: int = None) -> UserSessionTestable:
+        claims = self.decode_jwt_claims(token)
+        sub = claims.get("sub", "")
+        if not sub:
+            raise ValueError("Missing sub claim")
+        tier = claims.get("tier", "free")
+        exp = claims.get("exp")
+        if not isinstance(exp, int):
+            raise ValueError("Missing integer exp claim")
+        email = claims.get("email", f"{sub}@pulsevpn.io")
+        session = UserSessionTestable(sub, email, tier, token, exp)
+        if session.is_expired(now_ts=now_ts):
+            raise PermissionError("JWT token has expired")
+        self.current_session = session
+        self.stored_token = token
+        return session
+
+    def log_out(self):
+        self.current_session = None
+        self.stored_token = None
+
+
+class FastHopControllerTestable:
+    INTERVALS = {
+        "disabled": 0,
+        "fiveSeconds": 5,
+        "thirtySeconds": 30,
+        "oneMinute": 60,
+        "fiveMinutes": 300,
+    }
+
+    def __init__(self):
+        self.interval_name = "disabled"
+        self.interval_seconds = 0
+        self.state = "idle"
+        self.active_peer = None
+        self.standby_peer = None
+        self.is_standby_pre_warmed = False
+        self.hop_count = 0
+        self.elapsed_in_cycle = 0
+        self.candidate_queue = []
+
+    def enable(self, session: UserSessionTestable, interval_name: str, relays: list):
+        if interval_name == "disabled":
+            self.disable()
+            return True
+        if session is None or not session.is_pro:
+            raise PermissionError("Fast-Hop requires Pulse VPN Pro tier")
+        sorted_relays = sort_relays_by_jitter(relays)
+        if len(sorted_relays) < 2:
+            raise ValueError("At least 2 relays required for dual-peer standby")
+        self.candidate_queue = list(sorted_relays)
+        self.interval_name = interval_name
+        self.interval_seconds = self.INTERVALS[interval_name]
+        self.active_peer = self.candidate_queue[0]
+        self.standby_peer = self.candidate_queue[1]
+        self.is_standby_pre_warmed = False
+        self.elapsed_in_cycle = 0
+        self.state = "active"
+        return True
+
+    def pre_warm_standby(self):
+        if self.interval_seconds <= 0 or self.standby_peer is None:
+            return False
+        self.state = "preWarmingStandby"
+        self.is_standby_pre_warmed = True
+        return True
+
+    def execute_hop(self, session: UserSessionTestable):
+        if session is None or not session.is_pro:
+            raise PermissionError("Pro tier required to execute hop")
+        if not self.is_standby_pre_warmed:
+            self.pre_warm_standby()
+        self.state = "swapping"
+        prev_active = self.active_peer
+        self.active_peer = self.standby_peer
+        self.candidate_queue = [r for r in self.candidate_queue if r["ip"] != prev_active["ip"]]
+        self.candidate_queue.append(prev_active)
+        self.standby_peer = next(
+            (r for r in self.candidate_queue if r["ip"] != self.active_peer["ip"]),
+            prev_active,
+        )
+        self.is_standby_pre_warmed = False
+        self.elapsed_in_cycle = 0
+        self.hop_count += 1
+        self.state = "active"
+        return self.active_peer
+
+    def tick_second(self, session: UserSessionTestable):
+        if self.interval_seconds <= 0 or self.state == "idle":
+            return
+        self.elapsed_in_cycle += 1
+        remaining = self.interval_seconds - self.elapsed_in_cycle
+        if 0 < remaining <= 2 and not self.is_standby_pre_warmed:
+            self.pre_warm_standby()
+        elif remaining <= 0:
+            self.execute_hop(session)
+
+    def disable(self):
+        self.interval_name = "disabled"
+        self.interval_seconds = 0
+        self.state = "idle"
+        self.is_standby_pre_warmed = False
+        self.elapsed_in_cycle = 0
+
+
 # ======================================================================
 # Unit Tests
 # ======================================================================
@@ -474,6 +628,8 @@ vg-uswest.opengw.net,203.0.113.3,30000,8,120000000,United States,US,20,54321,200
             "relay_discovery.dart",
             "killswitch.dart",
             "telemetry.dart",
+            "auth_service.dart",
+            "fast_hop.dart",
         ]
 
         for fname in dart_files:
@@ -510,6 +666,102 @@ vg-uswest.opengw.net,203.0.113.3,30000,8,120000000,United States,US,20,54321,200
             self.assertIn("enum VpnConnectionState", c)
             self.assertIn("class VpnStateMachine", c)
             self.assertIn("class BandwidthTelemetry", c)
+
+        # Verify auth_service.dart has UserTier, UserSession, AuthService, decodeJwtClaims
+        with open(os.path.join(lib_core, "auth_service.dart"), "r", encoding="utf-8") as f:
+            c = f.read()
+            self.assertIn("enum UserTier", c)
+            self.assertIn("class UserSession", c)
+            self.assertIn("class AuthService", c)
+            self.assertIn("decodeJwtClaims", c)
+
+        # Verify fast_hop.dart has FastHopInterval, FastHopController, executeHop
+        with open(os.path.join(lib_core, "fast_hop.dart"), "r", encoding="utf-8") as f:
+            c = f.read()
+            self.assertIn("enum FastHopInterval", c)
+            self.assertIn("class FastHopController", c)
+            self.assertIn("executeHop", c)
+            self.assertIn("preWarmStandby", c)
+
+    # 8. Pro Authentication & Fast-Hop Multi-Relay Tests
+    def test_auth_service_jwt_decode_tier_and_expiry(self):
+        auth = AuthServiceTestable()
+        future_exp = int(time.time()) + 3600
+        pro_jwt = auth.create_jwt("user_99", "shivansh@pulsevpn.io", "pro", future_exp)
+
+        claims = auth.decode_jwt_claims(pro_jwt)
+        self.assertEqual(claims["sub"], "user_99")
+        self.assertEqual(claims["tier"], "pro")
+        self.assertEqual(claims["exp"], future_exp)
+
+        session = auth.verify_token(pro_jwt)
+        self.assertTrue(session.is_pro)
+        self.assertEqual(session.user_id, "user_99")
+        self.assertEqual(auth.stored_token, pro_jwt)
+
+        # Free tier check
+        free_jwt = auth.create_jwt("user_100", "free@pulsevpn.io", "free", future_exp)
+        free_session = auth.verify_token(free_jwt)
+        self.assertFalse(free_session.is_pro)
+
+        # Expired token rejection
+        past_exp = int(time.time()) - 60
+        expired_jwt = auth.create_jwt("user_99", "shivansh@pulsevpn.io", "pro", past_exp)
+        with self.assertRaises(PermissionError):
+            auth.verify_token(expired_jwt)
+
+        auth.log_out()
+        self.assertIsNone(auth.current_session)
+        self.assertIsNone(auth.stored_token)
+
+    def test_fast_hop_dual_peer_prewarm_and_5s_rotation(self):
+        auth = AuthServiceTestable()
+        future_exp = int(time.time()) + 3600
+        pro_session = auth.verify_token(auth.create_jwt("pro_1", "pro@pulsevpn.io", "pro", future_exp))
+        free_session = auth.verify_token(auth.create_jwt("free_1", "free@pulsevpn.io", "free", future_exp))
+
+        csv_sample = """#HostName,IP,Score,Ping,Speed,CountryLong,CountryShort,NumVpnSessions,Uptime,TotalUsers,TotalTraffic,LogType,Operator,Message,OpenVPN_ConfigData_Base64
+vg-tokyo,192.0.2.10,50000,15,85000000,Japan,JP,10,12345,100,5000,2,Admin,Msg,Y29uZmlnMQ==
+vg-frankfurt,198.51.100.20,40000,45,45000000,Germany,DE,5,67890,50,2500,2,Admin,Msg,Y29uZmlnMg==
+vg-uswest,203.0.113.30,30000,8,120000000,United States,US,20,54321,200,9000,2,Admin,Msg,Y29uZmlnMw==
+"""
+        relays = parse_vpngate_csv(csv_sample)
+        controller = FastHopControllerTestable()
+
+        # Free user must be blocked from enabling Fast-Hop
+        with self.assertRaises(PermissionError):
+            controller.enable(free_session, "fiveSeconds", relays)
+
+        # Pro user enables 5-second Fast-Hop
+        self.assertTrue(controller.enable(pro_session, "fiveSeconds", relays))
+        self.assertEqual(controller.state, "active")
+        # Lowest jitter/ping is US (8ms), standby is JP (15ms)
+        self.assertEqual(controller.active_peer["country_short"], "US")
+        self.assertEqual(controller.standby_peer["country_short"], "JP")
+        self.assertFalse(controller.is_standby_pre_warmed)
+
+        # Tick 1s, 2s -> still active (3s remaining)
+        controller.tick_second(pro_session)
+        controller.tick_second(pro_session)
+        self.assertEqual(controller.state, "active")
+        self.assertFalse(controller.is_standby_pre_warmed)
+
+        # Tick 3s -> 2s remaining before hop -> triggers standby pre-warm handshake
+        controller.tick_second(pro_session)
+        self.assertEqual(controller.state, "preWarmingStandby")
+        self.assertTrue(controller.is_standby_pre_warmed)
+
+        # Tick 4s -> 1s remaining -> stays pre-warmed
+        controller.tick_second(pro_session)
+        self.assertTrue(controller.is_standby_pre_warmed)
+
+        # Tick 5s -> 0s remaining -> executes 0ms make-before-break route swap
+        controller.tick_second(pro_session)
+        self.assertEqual(controller.hop_count, 1)
+        self.assertEqual(controller.state, "active")
+        self.assertEqual(controller.active_peer["country_short"], "JP")
+        self.assertEqual(controller.standby_peer["country_short"], "DE")
+        self.assertFalse(controller.is_standby_pre_warmed)
 
     # 7. Verify Phase 3 Native Platform Integration, UI Dashboard & Packaging
     def test_android_manifest_and_services(self):
