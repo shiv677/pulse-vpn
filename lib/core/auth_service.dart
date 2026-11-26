@@ -78,6 +78,9 @@ class AuthService {
   static const String defaultServerSecret =
       'pulse_vpn_secure_hmac_sha256_server_secret_2026';
 
+  /// Master administrative secret passkey for immediate Pro provisioning
+  static const String proMasterPasskey = 'pulse_pro_admin_2026';
+
   final TokenPersistence persistence;
   final String serverSecret;
   UserSession? _currentSession;
@@ -257,6 +260,18 @@ class AuthService {
     } else if (password.trim().split('.').length == 3) {
       // User entered/pasted a signed JWT directly in the auth field
       token = password.trim();
+    } else if (password.trim() == proMasterPasskey || password.trim() == serverSecret) {
+      // Administrator Master Passkey: cryptographically signs an official 1-year Pro session
+      final trimmedEmail = email.trim().isEmpty ? 'admin@pulsevpn.io' : email.trim();
+      final userId = 'pro_${trimmedEmail.hashCode.abs()}';
+      final expiresAt = DateTime.now().toUtc().add(const Duration(days: 365));
+      token = createSignedJwt(
+        userId: userId,
+        email: trimmedEmail,
+        tier: UserTier.pro,
+        expiresAt: expiresAt,
+        secret: serverSecret,
+      );
     } else {
       final trimmedEmail = email.trim();
       if (trimmedEmail.isEmpty || password.isEmpty) {
