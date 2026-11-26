@@ -7,6 +7,8 @@ Zero external dependencies (uses standard library unittest).
 """
 
 import base64
+import hashlib
+import hmac
 import ipaddress
 import json
 import os
@@ -271,6 +273,10 @@ class BandwidthTelemetryCalculator:
 # 6. Pro Authentication & Fast-Hop Engine
 # ----------------------------------------------------------------------
 
+class SecurityException(Exception):
+    pass
+
+
 class UserSessionTestable:
     def __init__(self, user_id: str, email: str, tier: str, token: str, expires_at: int):
         self.user_id = user_id
@@ -289,18 +295,31 @@ class UserSessionTestable:
 
 
 class AuthServiceTestable:
-    def __init__(self):
+    DEFAULT_SECRET = "pulse_vpn_server_hmac_sha256_secret_key_v1"
+
+    def __init__(self, signing_key: str = DEFAULT_SECRET):
+        self.signing_key = signing_key
         self.stored_token = None
         self.current_session = None
 
     @staticmethod
-    def create_jwt(sub: str, email: str, tier: str, exp: int) -> str:
+    def compute_hmac_sha256(signing_input: str, secret: str) -> str:
+        digest = hmac.new(
+            secret.encode("utf-8"),
+            signing_input.encode("utf-8"),
+            hashlib.sha256,
+        ).digest()
+        return base64.urlsafe_b64encode(digest).decode("utf-8").rstrip("=")
+
+    @classmethod
+    def create_jwt(cls, sub: str, email: str, tier: str, exp: int, secret: str = DEFAULT_SECRET) -> str:
         header = base64.urlsafe_b64encode(json.dumps({"alg": "HS256", "typ": "JWT"}).encode()).decode().rstrip("=")
         payload = base64.urlsafe_b64encode(
             json.dumps({"sub": sub, "email": email, "tier": tier, "exp": exp}).encode()
         ).decode().rstrip("=")
-        sig = base64.urlsafe_b64encode(f"sig_{sub}_{tier}".encode()).decode().rstrip("=")
-        return f"{header}.{payload}.{sig}"
+        signing_input = f"{header}.{payload}"
+        sig = cls.compute_hmac_sha256(signing_input, secret)
+        return f"{signing_input}.{sig}"
 
     @staticmethod
     def decode_jwt_claims(token: str) -> dict:
@@ -312,7 +331,18 @@ class AuthServiceTestable:
         raw = base64.urlsafe_b64decode(payload_b64 + padding).decode("utf-8")
         return json.loads(raw)
 
-    def verify_token(self, token: str, now_ts: int = None) -> UserSessionTestable:
+    def verify_token(self, token: str, signing_key: str = None, now_ts: int = None) -> UserSessionTestable:
+        parts = token.strip().split(".")
+        if len(parts) != 3:
+            raise ValueError("Invalid JWT format")
+        header, payload, provided_sig = parts
+        secret = signing_key if signing_key is not None else self.signing_key
+        expected_sig = self.compute_hmac_sha256(f"{header}.{payload}", secret)
+        if not hmac.compare_digest(provided_sig, expected_sig):
+            raise SecurityException(
+                "Cryptographic signature verification failed: token is untrusted or tampered"
+            )
+
         claims = self.decode_jwt_claims(token)
         sub = claims.get("sub", "")
         if not sub:
@@ -328,6 +358,12 @@ class AuthServiceTestable:
         self.current_session = session
         self.stored_token = token
         return session
+
+    def sign_up(self, email: str, password: str, ttl_seconds: int = 86400) -> UserSessionTestable:
+        # All standard signups strictly default to UserTier.free
+        exp = int(time.time()) + ttl_seconds
+        token = self.create_jwt(f"usr_{abs(hash(email))}", email, "free", exp, self.signing_key)
+        return self.verify_token(token, signing_key=self.signing_key)
 
     def log_out(self):
         self.current_session = None
@@ -667,13 +703,18 @@ vg-uswest.opengw.net,203.0.113.3,30000,8,120000000,United States,US,20,54321,200
             self.assertIn("class VpnStateMachine", c)
             self.assertIn("class BandwidthTelemetry", c)
 
-        # Verify auth_service.dart has UserTier, UserSession, AuthService, decodeJwtClaims
+        # Verify auth_service.dart has UserTier, UserSession, AuthService, decodeJwtClaims, SecurityException, HMAC-SHA256
         with open(os.path.join(lib_core, "auth_service.dart"), "r", encoding="utf-8") as f:
             c = f.read()
             self.assertIn("enum UserTier", c)
             self.assertIn("class UserSession", c)
             self.assertIn("class AuthService", c)
+            self.assertIn("class SecurityException", c)
             self.assertIn("decodeJwtClaims", c)
+            self.assertIn("computeHmacSha256", c)
+            self.assertIn("Cryptographic signature verification failed: token is untrusted or tampered", c)
+            self.assertNotIn("contains('pro')", c)
+            self.assertNotIn("overrideTier", c)
 
         # Verify fast_hop.dart has FastHopInterval, FastHopController, executeHop
         with open(os.path.join(lib_core, "fast_hop.dart"), "r", encoding="utf-8") as f:
@@ -713,6 +754,54 @@ vg-uswest.opengw.net,203.0.113.3,30000,8,120000000,United States,US,20,54321,200
         auth.log_out()
         self.assertIsNone(auth.current_session)
         self.assertIsNone(auth.stored_token)
+
+    def test_auth_service_hmac_sha256_tampering_and_pro_signature(self):
+        server_secret = "pulse_server_production_secret_2026"
+        auth = AuthServiceTestable(signing_key=server_secret)
+        future_exp = int(time.time()) + 3600
+
+        # 1. Standard signup (even with 'pro' in email) defaults strictly to UserTier.free
+        signup_session = auth.sign_up("shivansh.pro@pulsevpn.io", "StrongPassword123!")
+        self.assertEqual(signup_session.tier, "free")
+        self.assertFalse(signup_session.is_pro)
+
+        # 2. Tampering payload from tier='free' to tier='pro' must throw SecurityException
+        free_token = auth.create_jwt("user_50", "user50@pulsevpn.io", "free", future_exp, secret=server_secret)
+        header_seg, _, sig_seg = free_token.split(".")
+        tampered_payload = (
+            base64.urlsafe_b64encode(
+                json.dumps({
+                    "sub": "user_50",
+                    "email": "user50@pulsevpn.io",
+                    "tier": "pro",
+                    "exp": future_exp,
+                }).encode("utf-8")
+            )
+            .decode("utf-8")
+            .rstrip("=")
+        )
+        tampered_token = f"{header_seg}.{tampered_payload}.{sig_seg}"
+        with self.assertRaises(SecurityException) as ctx:
+            auth.verify_token(tampered_token, signing_key=server_secret)
+        self.assertIn(
+            "Cryptographic signature verification failed: token is untrusted or tampered",
+            str(ctx.exception),
+        )
+
+        # 3. Token signed with wrong attacker secret must throw SecurityException
+        forged_pro_token = auth.create_jwt(
+            "user_50", "user50@pulsevpn.io", "pro", future_exp, secret="attacker_forged_key"
+        )
+        with self.assertRaises(SecurityException):
+            auth.verify_token(forged_pro_token, signing_key=server_secret)
+
+        # 4. Legitimate server-signed HMAC-SHA256 Pro token succeeds and grants Pro tier
+        legit_pro_token = auth.create_jwt(
+            "user_50", "user50@pulsevpn.io", "pro", future_exp, secret=server_secret
+        )
+        pro_session = auth.verify_token(legit_pro_token, signing_key=server_secret)
+        self.assertTrue(pro_session.is_pro)
+        self.assertEqual(pro_session.tier, "pro")
 
     def test_fast_hop_dual_peer_prewarm_and_5s_rotation(self):
         auth = AuthServiceTestable()

@@ -23,7 +23,6 @@ class _AuthModalState extends State<AuthModal> {
   final TextEditingController _passwordController = TextEditingController();
 
   bool _isSignUpMode = false;
-  bool _requestProTier = true;
   bool _isLoading = false;
   String? _errorMessage;
 
@@ -33,8 +32,6 @@ class _AuthModalState extends State<AuthModal> {
     final session = widget.authService.currentSession;
     if (session != null) {
       _emailController.text = session.email;
-    } else {
-      _emailController.text = 'shivansh.pro@pulsevpn.io';
     }
   }
 
@@ -54,20 +51,17 @@ class _AuthModalState extends State<AuthModal> {
     try {
       final email = _emailController.text.trim();
       final password = _passwordController.text;
-      final selectedTier = _requestProTier ? UserTier.pro : UserTier.free;
 
       final UserSession session;
       if (_isSignUpMode) {
         session = await widget.authService.signUp(
           email: email,
           password: password,
-          tier: selectedTier,
         );
       } else {
         session = await widget.authService.logIn(
           email: email,
           password: password,
-          overrideTier: selectedTier,
         );
       }
 
@@ -101,7 +95,7 @@ class _AuthModalState extends State<AuthModal> {
   @override
   Widget build(BuildContext context) {
     final currentSession = widget.authService.currentSession;
-    final isProActive = currentSession?.isPro ?? _requestProTier;
+    final isProActive = currentSession?.isPro ?? false;
     final accentColor = isProActive ? const Color(0xFF10B981) : const Color(0xFF00F0FF);
 
     return Dialog(
@@ -198,15 +192,31 @@ class _AuthModalState extends State<AuthModal> {
                 ),
               ),
               const SizedBox(height: 12),
-              SwitchListTile(
-                contentPadding: EdgeInsets.zero,
-                title: const Text(
-                  'Enable Pulse Pro Tier (5s Fast-Hop Multi-Relay)',
-                  style: TextStyle(color: Color(0xFFCBD5E1), fontSize: 12),
+              Container(
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF1E293B).withOpacity(0.4),
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: const Color(0xFF334155)),
                 ),
-                value: _requestProTier,
-                activeColor: const Color(0xFF10B981),
-                onChanged: (val) => setState(() => _requestProTier = val),
+                child: Row(
+                  children: [
+                    Icon(
+                      isProActive ? Icons.verified : Icons.lock_outline,
+                      size: 16,
+                      color: isProActive ? const Color(0xFF10B981) : const Color(0xFF94A3B8),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        isProActive
+                            ? 'Pro Active: 5s Fast-Hop & Oracle Relay Unlocked'
+                            : 'Enter credentials or Pro token to activate Pro features',
+                        style: const TextStyle(color: Color(0xFF94A3B8), fontSize: 11),
+                      ),
+                    ),
+                  ],
+                ),
               ),
               if (_errorMessage != null) ...[
                 const SizedBox(height: 8),

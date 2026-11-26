@@ -1,11 +1,20 @@
-// Pulse VPN - Pro Authentication & Session Management Engine
+// Pulse VPN - Pro Authentication & Cryptographic Session Management Engine
 // lib/core/auth_service.dart
 
 import 'dart:convert';
+import 'package:crypto/crypto.dart';
 
 enum UserTier {
   free,
   pro,
+}
+
+class SecurityException implements Exception {
+  final String message;
+  const SecurityException(this.message);
+
+  @override
+  String toString() => 'SecurityException: $message';
 }
 
 class UserSession {
@@ -40,7 +49,6 @@ class UserSession {
       };
 }
 
-/// Abstract interface for persisting auth tokens securely across platforms
 abstract class TokenPersistence {
   Future<void> saveToken(String token);
   Future<String?> loadToken();
@@ -65,18 +73,45 @@ class InMemoryTokenPersistence implements TokenPersistence {
 }
 
 class AuthService {
+  /// Default server secret used for cryptographic token verification.
+  /// In cloud/production deployments, this matches the server's private PULSE_AUTH_SECRET.
+  static const String defaultServerSecret =
+      'pulse_vpn_secure_hmac_sha256_server_secret_2026';
+
   final TokenPersistence persistence;
+  final String serverSecret;
   UserSession? _currentSession;
 
-  AuthService({TokenPersistence? persistence})
-      : persistence = persistence ?? InMemoryTokenPersistence();
+  AuthService({
+    TokenPersistence? persistence,
+    String? serverSecret,
+  })  : persistence = persistence ?? InMemoryTokenPersistence(),
+        serverSecret = serverSecret ?? defaultServerSecret;
 
   UserSession? get currentSession => _currentSession;
-
   bool get isAuthenticated =>
       _currentSession != null && !_currentSession!.isExpired();
-
   bool get isProUser => _currentSession?.isPro ?? false;
+
+  /// Computes HMAC-SHA256 signature over header.payload
+  static String computeHmacSignature(String headerAndPayload, String secret) {
+    final hmac = Hmac(sha256, utf8.encode(secret));
+    final digest = hmac.convert(utf8.encode(headerAndPayload));
+    return base64Url.encode(digest.bytes).replaceAll('=', '');
+  }
+
+  static String computeHmacSha256(String headerAndPayload, String secret) =>
+      computeHmacSignature(headerAndPayload, secret);
+
+  /// Constant-time string equality check to prevent timing attacks
+  static bool secureCompare(String a, String b) {
+    if (a.length != b.length) return false;
+    int result = 0;
+    for (int i = 0; i < a.length; i++) {
+      result |= a.codeUnitAt(i) ^ b.codeUnitAt(i);
+    }
+    return result == 0;
+  }
 
   /// Decodes standard JWT payload claims (`sub`, `email`, `tier`, `exp`)
   static Map<String, dynamic> decodeJwtClaims(String jwtToken) {
@@ -95,12 +130,13 @@ class AuthService {
     return decoded;
   }
 
-  /// Generates a signed-format JWT for local self-hosted or demo authentication
-  static String createLocalJwt({
+  /// Generates a tamper-proof cryptographically signed JWT with HMAC-SHA256
+  static String createSignedJwt({
     required String userId,
     required String email,
     required UserTier tier,
     required DateTime expiresAt,
+    String secret = defaultServerSecret,
   }) {
     final header = base64Url
         .encode(utf8.encode(jsonEncode({'alg': 'HS256', 'typ': 'JWT'})))
@@ -113,14 +149,30 @@ class AuthService {
           'exp': expiresAt.toUtc().millisecondsSinceEpoch ~/ 1000,
         })))
         .replaceAll('=', '');
-    final signature = base64Url
-        .encode(utf8.encode('pulse_vpn_sig_${userId}_${tier.name}'))
-        .replaceAll('=', '');
-    return '$header.$payload.$signature';
+    final toSign = '$header.$payload';
+    final signature = computeHmacSignature(toSign, secret);
+    return '$toSign.$signature';
   }
 
-  /// Verifies a JWT string and constructs an active UserSession
-  UserSession verifyToken(String token, {DateTime? now}) {
+  /// Verifies a JWT token cryptographically:
+  /// 1. Checks structure (3 parts)
+  /// 2. Validates HMAC-SHA256 signature against secret key
+  /// 3. Validates expiration timestamp
+  /// Throws SecurityException on signature mismatch or tampered data.
+  UserSession verifyToken(String token, {String? signingKey, String? secret, DateTime? now}) {
+    final parts = token.trim().split('.');
+    if (parts.length != 3) {
+      throw const FormatException('Invalid JWT format');
+    }
+
+    final key = signingKey ?? secret ?? serverSecret;
+    final expectedSig = computeHmacSignature('${parts[0]}.${parts[1]}', key);
+    if (!secureCompare(parts[2], expectedSig)) {
+      throw const SecurityException(
+        'Cryptographic signature verification failed: token is untrusted or tampered',
+      );
+    }
+
     final claims = decodeJwtClaims(token);
     final sub = (claims['sub'] ?? '').toString();
     if (sub.isEmpty) {
@@ -159,11 +211,11 @@ class AuthService {
     return session;
   }
 
-  /// Registers a new user account and persists the session token
+  /// Registers a standard user account. ALWAYS defaults to UserTier.free.
+  /// (Pro tier is NEVER granted by client email heuristics).
   Future<UserSession> signUp({
     required String email,
     required String password,
-    UserTier tier = UserTier.free,
     Duration ttl = const Duration(hours: 24),
   }) async {
     final trimmedEmail = email.trim();
@@ -176,14 +228,14 @@ class AuthService {
 
     final userId = 'usr_${trimmedEmail.hashCode.abs()}';
     final expiresAt = DateTime.now().toUtc().add(ttl);
-    final resolvedTier =
-        trimmedEmail.toLowerCase().contains('pro') ? UserTier.pro : tier;
 
-    final token = createLocalJwt(
+    // Standard client registrations ALWAYS default to free tier
+    final token = createSignedJwt(
       userId: userId,
       email: trimmedEmail,
-      tier: resolvedTier,
+      tier: UserTier.free,
       expiresAt: expiresAt,
+      secret: serverSecret,
     );
 
     final session = verifyToken(token);
@@ -192,36 +244,61 @@ class AuthService {
     return session;
   }
 
-  /// Logs in using either a Supabase/external JWT or email/password credentials
+  /// Logs in: if a server/Supabase signed JWT is provided, verifies its signature.
+  /// If standard credentials are used, registers a verified free session.
   Future<UserSession> logIn({
     required String email,
     required String password,
-    String? supabaseJwt,
-    UserTier? overrideTier,
+    String? signedToken,
   }) async {
     String token;
-    if (supabaseJwt != null && supabaseJwt.trim().isNotEmpty) {
-      token = supabaseJwt.trim();
-    } else if (password.split('.').length == 3) {
+    if (signedToken != null && signedToken.trim().isNotEmpty) {
+      token = signedToken.trim();
+    } else if (password.trim().split('.').length == 3) {
+      // User entered/pasted a signed JWT directly in the auth field
       token = password.trim();
     } else {
       final trimmedEmail = email.trim();
       if (trimmedEmail.isEmpty || password.isEmpty) {
         throw ArgumentError('Email and password are required');
       }
-      final inferredTier = overrideTier ??
-          (trimmedEmail.toLowerCase().contains('pro')
-              ? UserTier.pro
-              : UserTier.free);
       final userId = 'usr_${trimmedEmail.hashCode.abs()}';
       final expiresAt = DateTime.now().toUtc().add(const Duration(hours: 24));
-      token = createLocalJwt(
+      token = createSignedJwt(
         userId: userId,
         email: trimmedEmail,
-        tier: inferredTier,
+        tier: UserTier.free,
         expiresAt: expiresAt,
+        secret: serverSecret,
       );
     }
+
+    final session = verifyToken(token);
+    _currentSession = session;
+    await persistence.saveToken(token);
+    return session;
+  }
+
+  /// Explicitly provisions a verified Pro session using the server's private secret key.
+  /// Only usable by the administrator or backend server API with the serverSecret.
+  Future<UserSession> authenticateWithServerProSecret({
+    required String email,
+    required String serverAdminSecret,
+    Duration ttl = const Duration(days: 30),
+  }) async {
+    if (serverAdminSecret != serverSecret) {
+      throw const FormatException('Invalid server secret key. Pro tier cannot be provisioned.');
+    }
+    final trimmedEmail = email.trim();
+    final userId = 'pro_${trimmedEmail.hashCode.abs()}';
+    final expiresAt = DateTime.now().toUtc().add(ttl);
+    final token = createSignedJwt(
+      userId: userId,
+      email: trimmedEmail,
+      tier: UserTier.pro,
+      expiresAt: expiresAt,
+      secret: serverSecret,
+    );
 
     final session = verifyToken(token);
     _currentSession = session;
